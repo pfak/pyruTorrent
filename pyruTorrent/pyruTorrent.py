@@ -20,14 +20,13 @@
 
 import xmlrpc.client
 import base64
-import requests
-import json
+import socket
 import time
 import re
 import bencodepy
 from functools import wraps
 from hashlib import sha1
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 
 class Misc:
@@ -55,6 +54,10 @@ class Misc:
         return (f'{scheme}://'
                 f'{username or ""}{password and f":{password}" or ""}{username and "@" or ""}'
                 f'{host}{port and f":{port}" or ""}{_path or ""}')
+
+    def escape_chars(path):
+        pattern = re.compile(r'([ :,;])')
+        return pattern.sub(r'\\\1', path)
 
 
 class BencodeUtils:
@@ -89,12 +92,55 @@ class BencodeUtils:
     def info_to_hash(self, info):
         return sha1(bencodepy.bencode(info)).hexdigest()
 
+class SCGITransport(xmlrpc.client.Transport):
+    def __init__(self, socket_path):
+        super().__init__()
+        self.socket_path = socket_path
+
+    def request(self, host, handler, request_body, verbose=False):
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(self.socket_path)
+
+        scgi_headers = (
+            f"CONTENT_LENGTH\0{len(request_body)}\0"
+            "SCGI\0"
+            "1\0"
+            "REQUEST_METHOD\0POST\0"
+            "REQUEST_URI\0/RPC2\0"
+        )
+        netstring = f"{len(scgi_headers)}:{scgi_headers},"
+
+        sock.sendall(netstring.encode('utf-8') + request_body)
+
+        response = b""
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            response += data
+
+        sock.close()
+
+        try:
+            response = response.split(b"\r\n\r\n", 1)[1]  # Remove SCGI headers
+            p, u = self.getparser()
+            p.feed(response)
+            return u.close()
+        except Exception as e:
+            raise
 
 class rTorrentRPC:
     
     def __init__(self, **kwargs):
         self.rpc_uri = Misc.to_uri(**kwargs)
-        self.client = xmlrpc.client.ServerProxy(uri=self.rpc_uri, verbose=False, allow_none=True)
+        parsed_uri = urlparse(self.rpc_uri)
+        if parsed_uri.scheme == "unix":
+            socket_path = parsed_uri.path
+            transport = SCGITransport(socket_path)
+            self.client = xmlrpc.client.ServerProxy(uri='http://localhost', transport=transport, verbose=False, allow_none=True)
+        else:
+            self.client = xmlrpc.client.ServerProxy(uri=self.rpc_uri, verbose=False, allow_none=True)
 
 
 class RPCMethodHelpers:
@@ -445,17 +491,18 @@ class RPCMethods(RPCMethodHelpers):
     @RPCMethodHelpers.formatter
     def torrent_add_file(_hash, data, name, comment, label, download_path, ratio_group, add_stopped, add_name_to_path, save_torrent):
         ratio_group = ratio_group and f'if=(not, (d.views)), (cat, $d.views.push_back_unique={ratio_group}, $view.set_visible={ratio_group}, $d.views=), (cat, "")' or ''
+
         return {
             'add_torrent':   (
                 add_stopped and 'load.raw' or 'load.raw_start',
                 '',
                 data,
-                f'd.set_custom1={label}',
-                f'd.set_custom2=VRS24mrker{comment}',
-                f'd.set_custom=x-filename,{quote(name)}',
-                f'{"" if save_torrent else "d.delete_tied="}',
+                f'd.custom1.set={label}',
+                f'd.custom2.set=VRS24mrker{comment}',
+                f'd.custom.set=x-filename,{quote(name)}',
+                '' if save_torrent else 'd.delete_tied=',
                 f'execute=mkdir,-p,"{download_path}"',
-                f'{"d.set_directory=" if add_name_to_path else "d.set_directory_base="}"{download_path}"',
+                ('d.directory.set=' if add_name_to_path else f'd.directory_base.set=') + Misc.escape_chars(download_path),
                 ratio_group
             ),
             'hash': ('cat', '', _hash),
